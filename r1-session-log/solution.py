@@ -1,195 +1,136 @@
-#!/usr/bin/env python3
 import sys
-import time
-
 
 class Stack:
     def __init__(self):
-        self.d = []
-
+        self._top = None
     def push(self, x):
-        self.d.append(x)
-
+        self._top = (x, self._top)
     def pop(self):
-        return self.d.pop()
-
+        if self._top is None:
+            raise IndexError("pop from empty stack")
+        value, self._top = self._top
+        return value
     def top(self):
-        return self.d[-1]
-
+        if self._top is None:
+            raise IndexError("top of empty stack")
+        return self._top[0]
     def empty(self):
-        return not self.d
+        return self._top is None
+    def __iter__(self):
+        node = self._top
+        while node is not None:
+            yield node[0]
+            node = node[1]
 
+def parse_event(raw_line, expected_tokens):
+    tokens = raw_line.split()
+    if not tokens or len(tokens) not in (2, 3):
+        return None
+    kind, name = tokens[0], tokens[1]
+    if kind not in ("LOGIN", "LOGOUT"):
+        return None
+    if len(tokens) == 2:
+        return None if expected_tokens == 3 else (kind, name, None, 2)
+    if expected_tokens == 2 or not tokens[2].isdigit():
+        return None
+    return (kind, name, int(tokens[2]), 3)
 
-class BaseParser:
-    def __init__(self):
-        self.common = Stack()
-        self.done = 0
-        self.active = 0
-        self.peak = 0
-        self.peak_line = 0
-        self.errs = []
+class Analizer:
+    def __init__(self, per_user=False, force_times=False):
+        self.per_user = per_user
+        self.stacks = {} if per_user else None
+        self.stack = None if per_user else Stack()
+        self.expected_tokens = 3 if force_times else None
+        self.sessions_closed = 0
+        self.errors = []
+        self.active = self.peak = self.peak_line = 0
+        self.duration_sum = self.duration_count = 0
 
-    def open_sess(self, u, ln):
-        self.common.push((u, ln))
+    def _handle_login(self, name, line_no, t):
+        rec = (name, line_no, t)
+        if self.per_user:
+            st = self.stacks.get(name) or Stack()
+            self.stacks[name] = st
+            st.push(rec)
+        else:
+            self.stack.push(rec)
         self.active += 1
         if self.active > self.peak:
-            self.peak = self.active
-            self.peak_line = ln
+            self.peak, self.peak_line = self.active, line_no
 
-    def close_sess(self):
-        self.common.pop()
-        self.done += 1
-        self.active -= 1
-
-    def process(self, ln, line):
-        tok = line.split()
-        if not tok:
-            return
-        if len(tok) != 2 or tok[0] not in ("LOGIN", "LOGOUT") or not tok[1].isalnum():
-            self.errs.append((ln, "bad_event"))
-            return
-        cmd, u = tok
-        if cmd == "LOGIN":
-            self.open_sess(u, ln)
-            return
-        if self.common.empty():
-            self.errs.append((ln, "logout_without_login"))
-        elif self.common.top()[0] != u:
-            self.errs.append((ln, "order_violation"))
+    def _handle_logout(self, name, line_no, t):
+        if self.per_user:
+            st = self.stacks.get(name)
+            if not st or st.empty():
+                self.errors.append((line_no, "logout_without_login"))
+                return
+            popped = st.pop()
         else:
-            self.close_sess()
-
-    def finish(self):
-        unfinished = []
-        while not self.common.empty():
-            _, l = self.common.pop()
-            unfinished.append(l)
-        for l in sorted(unfinished):
-            self.errs.append((l, "session_not_closed"))
-
-    def output(self):
-        out = [f"ERROR {l} {c}" for l, c in self.errs]
-        out.append(f"SESSIONS {self.done}")
-        return "\n".join(out) + "\n"
-
-
-class AdvParser:
-    def __init__(self):
-        self.stacks = {}
-        self.done = 0
-        self.active = 0
-        self.peak = 0
-        self.peak_line = 0
-        self.errs = []
-
-    def open_sess(self, u, ln):
-        self.stacks.setdefault(u, Stack()).push(ln)
-        self.active += 1
-        if self.active > self.peak:
-            self.peak = self.active
-            self.peak_line = ln
-
-    def close_sess(self, u):
-        self.stacks[u].pop()
-        self.done += 1
+            if self.stack.empty():
+                self.errors.append((line_no, "logout_without_login"))
+                return
+            if self.stack.top()[0] != name:
+                self.errors.append((line_no, "order_violation"))
+                return
+            popped = self.stack.pop()
+        self.sessions_closed += 1
         self.active -= 1
+        _, _, open_t = popped
+        if self.expected_tokens == 3 and open_t is not None and t is not None:
+            self.duration_sum += t - open_t
+            self.duration_count += 1
 
-    def process(self, ln, line):
-        tok = line.split()
-        if not tok:
+    def process_line(self, line, line_no):
+        if not line.strip():
             return
-        if len(tok) != 2 or tok[0] not in ("LOGIN", "LOGOUT") or not tok[1].isalnum():
-            self.errs.append((ln, "bad_event"))
+        ev = parse_event(line, self.expected_tokens)
+        if ev is None:
+            self.errors.append((line_no, "bad_event"))
             return
-        cmd, u = tok
-        if cmd == "LOGIN":
-            self.open_sess(u, ln)
+        kind, name, t, n = ev
+        if self.expected_tokens is None:
+            self.expected_tokens = n
+        elif n != self.expected_tokens:
+            self.errors.append((line_no, "bad_event"))
             return
-        st = self.stacks.get(u)
-        if not st or st.empty():
-            self.errs.append((ln, "logout_without_login"))
+        if kind == "LOGIN":
+            self._handle_login(name, line_no, t)
         else:
-            self.close_sess(u)
+            self._handle_logout(name, line_no, t)
 
-    def finish(self):
-        unfinished = []
-        for u, st in self.stacks.items():
-            while not st.empty():
-                unfinished.append(st.pop())
-        for l in sorted(unfinished):
-            self.errs.append((l, "session_not_closed"))
-
-    def output(self):
-        out = [f"ERROR {l} {c}" for l, c in self.errs]
-        out.append(f"SESSIONS {self.done}")
-        out.append(f"PEAK {self.peak} {self.peak_line}")
-        return "\n".join(out) + "\n"
-
-
-def read_lines(path):
-    with open(path, "rb") as f:
-        for raw in f:
-            if len(raw) > 1_000_000:
-                raw = raw[:1_000_000]
-            yield raw.decode("utf-8", "replace").rstrip("\r\n")
-
-
-def run(inp, outp, advanced=False):
-    p = AdvParser() if advanced else BaseParser()
-    ln = 0
-    for line in read_lines(inp):
-        ln += 1
-        try:
-            p.process(ln, line)
-        except Exception:
-            p.errs.append((ln, "bad_event"))
-    p.finish()
-    with open(outp, "w", encoding="utf-8") as f:
-        f.write(p.output())
-
-
-def bench(inp, advanced=False):
-    t0 = time.perf_counter()
-    lines = list(read_lines(inp))
-    t1 = time.perf_counter()
-    p = AdvParser() if advanced else BaseParser()
-    ln = 0
-    for line in lines:
-        ln += 1
-        try:
-            p.process(ln, line)
-        except Exception:
-            p.errs.append((ln, "bad_event"))
-    p.finish()
-    t2 = time.perf_counter()
-    print(f"read:  {t1 - t0:.6f} s")
-    print(f"parse: {t2 - t1:.6f} s")
-
+    def finalize(self):
+        if self.per_user:
+            opened = [item for st in self.stacks.values() for item in st]
+        else:
+            opened = list(self.stack)
+        opened.sort(key=lambda r: r[1])
+        for _n, line_no, _t in opened:
+            self.errors.append((line_no, "session_not_closed"))
+        return self.errors
 
 def main():
     args = sys.argv[1:]
-    advanced = False
-    if "--advanced" in args:
-        advanced = True
-        args.remove("--advanced")
-    if len(args) == 2 and args[0] == "--bench":
-        bench(args[1], advanced)
-        return
+    per_user = "--per-user" in args
+    show_stats = "--stats" in args
+    force_times = "--times" in args
+    args = [a for a in args if a not in ("--per-user", "--stats", "--times")]
     if len(args) != 2:
-        sys.stderr.write(
-            "usage: solution.py [--advanced] input.txt output.txt | "
-            "--bench [--advanced] input.txt\n"
-        )
-        sys.exit(2)
-    try:
-        run(args[0], args[1], advanced)
-    except OSError as e:
-        sys.stderr.write(f"io error: {e}\n")
-        sys.exit(1)
-    except MemoryError:
-        sys.stderr.write("out of memory\n")
-        sys.exit(1)
-
+        print("usage: session_analizer.py <input> <output> [--per-user] [--stats] [--times]")
+        return
+    in_path, out_path = args
+    an = Analizer(per_user, force_times)
+    with open(in_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for i, line in enumerate(f, 1):
+            an.process_line(line, i)
+    an.finalize()
+    with open(out_path, "w", encoding="utf-8") as f:
+        for line_no, code in an.errors:
+            f.write(f"ERROR {line_no} {code}\n")
+        f.write(f"SESSIONS {an.sessions_closed}\n")
+        if show_stats and an.peak > 0:
+            f.write(f"PEAK {an.peak} {an.peak_line}\n")
+        if show_stats and an.duration_count > 0:
+            f.write(f"AVG_DURATION {an.duration_sum / an.duration_count}\n")
 
 if __name__ == "__main__":
     main()
