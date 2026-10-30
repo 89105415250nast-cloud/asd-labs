@@ -127,10 +127,11 @@ def main():
         for line_no, code in an.errors:
             f.write(f"ERROR {line_no} {code}\n")
         f.write(f"SESSIONS {an.sessions_closed}\n")
-        if show_stats and an.peak > 0:
-            f.write(f"PEAK {an.peak} {an.peak_line}\n")
-        if show_stats and an.duration_count > 0:
-            f.write(f"AVG_DURATION {an.duration_sum / an.duration_count}\n")
+    if show_stats:
+        if an.peak > 0:
+            sys.stderr.write(f"# stats: peak_concurrent={an.peak} at line={an.peak_line}\n")
+        if an.duration_count > 0:
+            sys.stderr.write(f"# stats: avg_duration={an.duration_sum / an.duration_count:.3f}\n")
 
 if __name__ == "__main__":
     main()

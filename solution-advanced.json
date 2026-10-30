@@ -1,0 +1,7 @@
+{
+  "author": "Anastasya",
+  "language": "Python 3",
+  "build": "",
+  "run": "python solution.py --per-user --stats --times"
+
+}
